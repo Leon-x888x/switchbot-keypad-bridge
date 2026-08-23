@@ -1,5 +1,6 @@
 #include "lock_session.h"
 
+#include <cstdio>
 #include <cstring>
 
 #include <esp_random.h>
@@ -36,6 +37,11 @@ void LockSession::reset() {
 }
 
 void LockSession::reset_transport() {
+  this->clear_decoded_();
+  this->recovery_iv_sent_ = false;
+}
+
+void LockSession::clear_decoded_() {
   this->plaintext_size_ = 0;
   this->header_ = FrameHeader{};
   this->command_ = DecodedCommand{};
@@ -45,7 +51,7 @@ void LockSession::reset_transport() {
 LockSession::Action LockSession::process_frame(const std::string &frame) {
   // Never expose stale decoded bytes or a stale response IV after a dropped
   // frame. The bridge may relay plaintext asynchronously after COMMAND.
-  this->reset_transport();
+  this->clear_decoded_();
 
   ESP_LOGV(TAG, "RX WIRE %zu bytes: %s", frame.size(),
            format_hex_pretty(reinterpret_cast<const uint8_t *>(frame.data()), frame.size()).c_str());
@@ -94,7 +100,16 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   // live generations.
   CryptoContext *generation = this->find_generation_(this->header_);
   if (generation == nullptr) {
-    ESP_LOGW(TAG, "Dropping frame: seq_a/seq_b mismatch (cross-session replay?)");
+    ESP_LOGW(TAG, "Unknown IV: len=%zu key=0x%02X seq=%02X%02X | live: %s", frame.size(),
+             this->header_.key_id, this->header_.seq_a, this->header_.seq_b,
+             this->describe_generations_().c_str());
+    if (!this->recovery_iv_sent_) {
+      this->recovery_iv_sent_ = true;
+      this->negotiate_new_iv_();
+      ESP_LOGW(TAG, "Offering a fresh IV to resynchronise the keypad");
+      return Action::SEND_IV;
+    }
+    ESP_LOGW(TAG, "Dropping frame: seq_a/seq_b mismatch (already offered a fresh IV)");
     return Action::NONE;
   }
   CryptoContext &context = *generation;
@@ -162,7 +177,7 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
 
   if (!context.used) {
     context.used = true;
-    ESP_LOGV(TAG, "Keypad switched to IV generation %u",
+    ESP_LOGI(TAG, "Keypad switched to IV generation %u",
              static_cast<unsigned>(context.serial));
   } else if (superseded) {
     ESP_LOGD(TAG, "Accepted delayed state poll under superseded IV");
@@ -240,8 +255,27 @@ void LockSession::negotiate_new_iv_() {
   slot.valid = true;
   std::memcpy(this->iv_response_.data() + IV_RESPONSE_HEADER,
               slot.iv.data(), AES_IV_SIZE);
+  ESP_LOGI(TAG, "New IV: generation %u seq=%02X%02X", static_cast<unsigned>(slot.serial),
+           slot.iv[0], slot.iv[1]);
   ESP_LOGV(TAG, "New IV (generation %u): %s", static_cast<unsigned>(slot.serial),
            format_hex_pretty(slot.iv.data(), AES_IV_SIZE).c_str());
+}
+
+// Compact one-line inventory for the unknown-IV warning: which generations the
+// bridge still holds, in negotiation order, and whether the keypad adopted them.
+std::string LockSession::describe_generations_() const {
+  std::string out;
+  for (const auto &generation : this->generations_) {
+    if (!generation.valid) {
+      continue;
+    }
+    char buf[32];
+    std::snprintf(buf, sizeof(buf), "%s#%u:%02X%02X%s", out.empty() ? "" : " ",
+                  static_cast<unsigned>(generation.serial), generation.iv[0], generation.iv[1],
+                  generation.used ? "*" : "");
+    out += buf;
+  }
+  return out.empty() ? "none" : out;
 }
 
 bool LockSession::seq_in_use_(uint8_t seq_a, uint8_t seq_b) const {
@@ -303,7 +337,7 @@ LockSession::CryptoContext &LockSession::allocate_generation_() {
     }
   }
   CryptoContext *victim = oldest_unused != nullptr ? oldest_unused : oldest;
-  ESP_LOGD(TAG, "Recycling IV generation %u", static_cast<unsigned>(victim->serial));
+  ESP_LOGI(TAG, "Recycling IV generation %u", static_cast<unsigned>(victim->serial));
   return *victim;
 }
 

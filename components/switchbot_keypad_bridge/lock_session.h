@@ -89,6 +89,9 @@ class LockSession {
   // pair loses frames whenever two handshakes overlap.
   static constexpr size_t GENERATIONS = 4;
 
+  // Transient per-frame state only; the recovery-IV budget survives, so it is
+  // spent once per BLE connection rather than once per received frame.
+  void clear_decoded_();
   bool is_iv_request_(const std::string &frame) const;
   void negotiate_new_iv_();
 
@@ -130,6 +133,7 @@ class LockSession {
                           size_t length);
   bool seq_matches_(const CryptoContext &context, const FrameHeader &header) const;
   bool seq_in_use_(uint8_t seq_a, uint8_t seq_b) const;
+  std::string describe_generations_() const;
   bool any_generation_valid_() const;
   bool has_newer_used_generation_(const CryptoContext &context) const;
   CryptoContext *find_generation_(const FrameHeader &header);
@@ -137,6 +141,14 @@ class LockSession {
 
   std::array<CryptoContext, GENERATIONS> generations_{};
   uint32_t serial_counter_{0};
+
+  // A keypad that comes back from a long idle can open with an IV this bridge
+  // no longer holds. It has no way to ask for a new one except by timing out
+  // first, so answer the very first unmatched frame of a connection with a
+  // fresh IV instead of silence. Once per connection: reset_transport() runs on
+  // every BLE connect and disconnect, which is exactly the retry budget we want
+  // and keeps a noisy peer from churning the generation ring.
+  bool recovery_iv_sent_{false};
 
   std::array<uint8_t, 20> iv_response_{0x01, 0x00, 0x00, 0x00};
 

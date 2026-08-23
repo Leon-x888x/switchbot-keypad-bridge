@@ -2,7 +2,7 @@
 
 // Encrypted-session state machine for the emulated SwitchBot Lock: token-slot
 // learning, IV negotiation, frame validation, AES-CTR transport crypto and
-// anti-replay. Bytes in, decoded commands out â€” no NimBLE and no ESPHome
+// anti-replay. Bytes in, decoded commands out — no NimBLE and no ESPHome
 // entities, so the entire validation pipeline lives in one reviewable place.
 // The bridge owns the transport (BLE notify) and the business logic (lock
 // state, entity publishing) on top of it.
@@ -34,7 +34,7 @@ class LockSession {
 
   // Outcome of feeding one received frame into the session.
   enum class Action : uint8_t {
-    NONE,     // frame dropped â€” the reason has been logged
+    NONE,     // frame dropped — the reason has been logged
     SEND_IV,  // IV request handled: notify iv_response()
     COMMAND,  // decrypted and decoded: header() / command() are valid
   };
@@ -74,7 +74,7 @@ class LockSession {
   size_t iv_response_size() const { return this->iv_response_.size(); }
 
   // Encrypt `plaintext` into a notify-ready packet
-  // [0x01, key_id, seq_a, seq_b, ciphertextâ€¦] written to `out` (which must
+  // [0x01, key_id, seq_a, seq_b, ciphertext…] written to `out` (which must
   // hold MAX_PACKET bytes). Returns the packet length, 0 on failure (logged).
   size_t encrypt_response(const FrameHeader &header, const uint8_t *plaintext,
                           size_t length, uint8_t out[MAX_PACKET]);

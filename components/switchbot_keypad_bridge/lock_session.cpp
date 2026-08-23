@@ -28,8 +28,10 @@ constexpr size_t IV_RESPONSE_HEADER = 4;  // iv_response_ prefix before the IV b
 }  // namespace
 
 void LockSession::reset() {
-  this->active_ = CryptoContext{};
-  this->pending_ = CryptoContext{};
+  for (auto &generation : this->generations_) {
+    generation = CryptoContext{};
+  }
+  this->serial_counter_ = 0;
   this->reset_transport();
 }
 
@@ -58,9 +60,10 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
       this->slot_id_ = requested_slot;
     }
     ESP_LOGD(TAG, "IV request");
-    // Do not overwrite active_ yet. Vision-family keypads can send a delayed
-    // state poll from the previous generation after requesting the next IV.
-    this->rotate_pending_iv_();
+    // Add a generation instead of replacing one. Vision-family keypads can
+    // renegotiate several times in a row and still finish frames from an
+    // earlier generation afterwards.
+    this->negotiate_new_iv_();
     return Action::SEND_IV;
   }
 
@@ -81,21 +84,20 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   // Refuse encrypted frames before any IV has been negotiated for this key.
   // BLE reconnects may preserve active_, but a fresh boot/reset must not
   // decrypt against a zero or unrelated IV.
-  if (!this->active_.valid && !this->pending_.valid) {
+  if (!this->any_generation_valid_()) {
     ESP_LOGW(TAG, "Dropping encrypted frame: no IV negotiated");
     return Action::NONE;
   }
 
-  // The protocol echoes IV[0..1] as seq_a/seq_b. Prefer pending_ when the
-  // keypad has switched; otherwise retain active_ just long enough to finish
-  // an in-flight poll. rotate_pending_iv_() guarantees their seq pairs differ.
-  const bool uses_pending = this->seq_matches_(this->pending_, this->header_);
-  const bool uses_active = this->seq_matches_(this->active_, this->header_);
-  if (!uses_pending && !uses_active) {
+  // The protocol echoes IV[0..1] as seq_a/seq_b, so the seq pair selects the
+  // generation. negotiate_new_iv_() guarantees the pair is unique across all
+  // live generations.
+  CryptoContext *generation = this->find_generation_(this->header_);
+  if (generation == nullptr) {
     ESP_LOGW(TAG, "Dropping frame: seq_a/seq_b mismatch (cross-session replay?)");
     return Action::NONE;
   }
-  CryptoContext &context = uses_pending ? this->pending_ : this->active_;
+  CryptoContext &context = *generation;
 
   const size_t ct_len = frame.size() - HEADER_LEN;
   if (ct_len > MAX_PAYLOAD) {
@@ -121,12 +123,16 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
 
   this->command_ = decode_lock_command(plaintext, ct_len);
 
-  // Once a new IV has been advertised, the superseded generation is accepted
-  // only for an idempotent state poll that was already in flight. In
-  // particular, never let a delayed/captured lock or unlock cross the IV
-  // boundary even if its ciphertext was not present in the small replay ring.
-  if (!uses_pending && this->pending_.valid &&
-      this->command_.type != CommandType::STATE_POLL) {
+  // A generation is superseded only once the keypad has *proved* it moved on
+  // by sending a frame under a newer IV. From that point the old generation is
+  // accepted for idempotent state polls only, so a delayed or captured lock or
+  // unlock can never cross the hand-off boundary even if its ciphertext was
+  // not present in the small replay ring. Merely advertising the next IV does
+  // not supersede anything: the keypad routinely keeps using the current
+  // generation after asking for a new one, and dropping those frames left it
+  // without an answer.
+  const bool superseded = this->has_newer_used_generation_(context);
+  if (superseded && this->command_.type != CommandType::STATE_POLL) {
     ESP_LOGW(TAG, "Dropping non-poll frame under superseded IV");
     this->command_ = DecodedCommand{};
     return Action::NONE;
@@ -154,12 +160,12 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   this->response_iv_ = context.iv;
   this->response_iv_valid_ = true;
 
-  if (uses_pending) {
-    this->active_ = this->pending_;
-    this->pending_ = CryptoContext{};
-    ESP_LOGV(TAG, "Pending IV promoted");
-  } else if (this->pending_.valid) {
-    ESP_LOGD(TAG, "Accepted delayed state poll under previous IV");
+  if (!context.used) {
+    context.used = true;
+    ESP_LOGV(TAG, "Keypad switched to IV generation %u",
+             static_cast<unsigned>(context.serial));
+  } else if (superseded) {
+    ESP_LOGD(TAG, "Accepted delayed state poll under superseded IV");
   }
 
   return Action::COMMAND;
@@ -200,33 +206,105 @@ bool LockSession::xcrypt_(const std::array<uint8_t, AES_IV_SIZE> &iv,
   return aes_ctr_xcrypt(this->aes_key_, iv.data(), input, output, length);
 }
 
-void LockSession::rotate_pending_iv_() {
-  this->pending_ = CryptoContext{};
-  auto fill_iv = [this]() {
+void LockSession::negotiate_new_iv_() {
+  CryptoContext &slot = this->allocate_generation_();
+  slot = CryptoContext{};  // invalid while we search, so it never matches itself
+  auto fill_iv = [&slot]() {
     for (size_t i = 0; i < AES_IV_SIZE; i += 4) {
       const uint32_t value = esp_random();
-      std::memcpy(this->pending_.iv.data() + i, &value, 4);
+      std::memcpy(slot.iv.data() + i, &value, 4);
     }
   };
   fill_iv();
 
-  // seq_a/seq_b are the only generation selector carried on the wire. Avoid
-  // an ambiguous active/pending pair. Bound the retries so a broken RNG
-  // cannot stall the BLE task; the final bit flip still makes the pair unique.
+  // seq_a/seq_b are the only generation selector carried on the wire, so the
+  // pair must be unique across every live generation. Bound the RNG retries so
+  // a broken RNG cannot stall the BLE task, then fall back to a deterministic
+  // scan of seq_b, which always finds a free pair: at most GENERATIONS - 1
+  // other generations are live and 256 candidates exist.
   size_t retries = 0;
-  while (this->active_.valid && this->pending_.iv[0] == this->active_.iv[0] &&
-         this->pending_.iv[1] == this->active_.iv[1] && retries++ < 4) {
+  while (this->seq_in_use_(slot.iv[0], slot.iv[1]) && retries++ < 4) {
     fill_iv();
   }
-  if (this->active_.valid && this->pending_.iv[0] == this->active_.iv[0] &&
-      this->pending_.iv[1] == this->active_.iv[1]) {
-    this->pending_.iv[1] ^= 0x01;
+  if (this->seq_in_use_(slot.iv[0], slot.iv[1])) {
+    for (uint16_t delta = 1; delta <= 0xFF; ++delta) {
+      const uint8_t candidate = static_cast<uint8_t>(slot.iv[1] ^ delta);
+      if (!this->seq_in_use_(slot.iv[0], candidate)) {
+        slot.iv[1] = candidate;
+        break;
+      }
+    }
   }
-  this->pending_.valid = true;
+
+  slot.serial = ++this->serial_counter_;
+  slot.valid = true;
   std::memcpy(this->iv_response_.data() + IV_RESPONSE_HEADER,
-              this->pending_.iv.data(), AES_IV_SIZE);
-  ESP_LOGV(TAG, "Pending IV: %s",
-           format_hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
+              slot.iv.data(), AES_IV_SIZE);
+  ESP_LOGV(TAG, "New IV (generation %u): %s", static_cast<unsigned>(slot.serial),
+           format_hex_pretty(slot.iv.data(), AES_IV_SIZE).c_str());
+}
+
+bool LockSession::seq_in_use_(uint8_t seq_a, uint8_t seq_b) const {
+  for (const auto &generation : this->generations_) {
+    if (generation.valid && generation.iv[0] == seq_a && generation.iv[1] == seq_b) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool LockSession::any_generation_valid_() const {
+  for (const auto &generation : this->generations_) {
+    if (generation.valid) {
+      return true;
+    }
+  }
+  return false;
+}
+
+bool LockSession::has_newer_used_generation_(const CryptoContext &context) const {
+  for (const auto &generation : this->generations_) {
+    if (generation.valid && generation.used && generation.serial > context.serial) {
+      return true;
+    }
+  }
+  return false;
+}
+
+LockSession::CryptoContext *LockSession::find_generation_(const FrameHeader &header) {
+  CryptoContext *match = nullptr;
+  for (auto &generation : this->generations_) {
+    if (this->seq_matches_(generation, header) &&
+        (match == nullptr || generation.serial > match->serial)) {
+      match = &generation;
+    }
+  }
+  return match;
+}
+
+// Free slot first; then the oldest generation the keypad never adopted, since
+// an advertised-but-unused IV carries no live traffic; only if every slot is
+// in use does the oldest adopted generation get recycled. Without the
+// unused-first rule a keypad that asks for a new IV on every reconnect but
+// keeps talking under the one it already has would evict its own live
+// generation after GENERATIONS handshakes.
+LockSession::CryptoContext &LockSession::allocate_generation_() {
+  CryptoContext *oldest = nullptr;
+  CryptoContext *oldest_unused = nullptr;
+  for (auto &generation : this->generations_) {
+    if (!generation.valid) {
+      return generation;
+    }
+    if (oldest == nullptr || generation.serial < oldest->serial) {
+      oldest = &generation;
+    }
+    if (!generation.used && (oldest_unused == nullptr || generation.serial < oldest_unused->serial)) {
+      oldest_unused = &generation;
+    }
+  }
+  CryptoContext *victim = oldest_unused != nullptr ? oldest_unused : oldest;
+  ESP_LOGD(TAG, "Recycling IV generation %u", static_cast<unsigned>(victim->serial));
+  return *victim;
 }
 
 bool LockSession::is_replayed_ciphertext_(const CryptoContext &context,

@@ -2,8 +2,10 @@
 
 // Encrypted-session state machine for the emulated SwitchBot Lock: token-slot
 // learning, IV negotiation, frame validation, AES-CTR transport crypto and
-// anti-replay. Bytes in, decoded commands out — no NimBLE and no ESPHome
-// entities, so the entire validation pipeline lives in one reviewable place.
+// action deduplication. CTR does not authenticate messages; this layer cannot
+// prevent a forged, previously unseen action. Bytes in, decoded commands out —
+// no NimBLE and no ESPHome entities, so the entire validation pipeline lives
+// in one reviewable place.
 // The bridge owns the transport (BLE notify) and the business logic (lock
 // state, entity publishing) on top of it.
 
@@ -49,13 +51,19 @@ class LockSession {
   // session and must keep the IV alive.
   void reset();
 
-  // Clear transient decoded-frame state while preserving the negotiated IV and
-  // replay window. Called on BLE connect/disconnect events because some
-  // keypads continue the same logical session after a transport reconnect.
+  // Clear transient decoded-frame state while preserving active/pending IVs
+  // and their action histories. A transport boundary does revoke the one-shot
+  // Fast Unlock overlap, which is valid only within one BLE connection.
   void reset_transport();
 
   // Forget the learned token slot as well (pairing reset only).
   void forget_slot() { this->slot_id_ = 0x00; }
+
+  // After process_frame() dropped a frame whose seq_a/seq_b matched no IV we
+  // hold: prepare a fresh pending IV for the bridge to notify via
+  // iv_response(). At most once per BLE connection and never during a Fast
+  // Unlock hand-off; returns false when nothing should be sent.
+  bool offer_recovery_iv();
 
   // Validate, decrypt and decode one received frame. On COMMAND the decoded
   // result is available via header()/command() until the next call.
@@ -81,19 +89,12 @@ class LockSession {
 
  private:
   static constexpr size_t AES_IV_SIZE = 16;
-  static constexpr size_t REPLAY_HISTORY_SIZE = 8;
+  static constexpr size_t CREDENTIAL_INDEX_COUNT = 256;
+  static constexpr size_t UNLOCK_HISTORY_BYTES = CREDENTIAL_INDEX_COUNT / 8;
 
-  // Number of crypto generations kept alive at once. Vision-family keypads
-  // renegotiate the IV on every BLE reconnect and keep emitting frames from
-  // the generation(s) they still had in flight, so a single active/pending
-  // pair loses frames whenever two handshakes overlap.
-  static constexpr size_t GENERATIONS = 4;
-
-  // Transient per-frame state only; the recovery-IV budget survives, so it is
-  // spent once per BLE connection rather than once per received frame.
-  void clear_decoded_();
   bool is_iv_request_(const std::string &frame) const;
-  void negotiate_new_iv_();
+  void ensure_pending_iv_();
+  void clear_transient_();
 
   // AES-CTR is symmetric, so a single primitive covers both directions.
   bool xcrypt_(const std::array<uint8_t, AES_IV_SIZE> &iv, const uint8_t *input,
@@ -107,48 +108,35 @@ class LockSession {
   // no encrypted frame is accepted until an IV handshake has set it.
   uint8_t slot_id_{0x00};
 
-  struct ReplayEntry {
-    std::array<uint8_t, MAX_PAYLOAD> data{};
-    size_t length{0};
-  };
-
-  // An IV and its replay window form one logical crypto generation. Generations
-  // are negotiated in order (`serial`) and stay usable until they are evicted
-  // from the ring. `used` records that the keypad proved it switched to this
-  // IV by sending a frame under it; only a *used* newer generation demotes an
-  // older one to poll-only, so merely advertising the next IV never swallows a
-  // lock/unlock the keypad is still sending under the current one.
+  // An IV and its action history form one logical crypto generation. A new IV
+  // remains pending until the keypad proves it switched by sending a frame
+  // whose seq bytes match it. Keeping the previous generation alive during
+  // that hand-off lets us answer an already-in-flight state poll without
+  // reopening old lock/unlock actions.
   struct CryptoContext {
     std::array<uint8_t, AES_IV_SIZE> iv{};
-    std::array<ReplayEntry, REPLAY_HISTORY_SIZE> replay_history{};
-    size_t replay_head{0};
-    uint32_t serial{0};
+    // One bit per supported method + wire credential index, plus LOCK.
+    // Retain every accepted action until this IV is discarded: there is no
+    // eviction or heap growth, and ignored payload bytes cannot create a new
+    // identity for the same method and credential.
+    std::array<std::array<uint8_t, UNLOCK_HISTORY_BYTES>, UNLOCK_METHOD_COUNT> unlock_history{};
+    bool lock_seen{false};
+    bool late_action_allowed{false};
+    bool handoff_poll_seen{false};
     bool valid{false};
-    bool used{false};
   };
 
-  bool is_replayed_ciphertext_(const CryptoContext &context,
-                               const uint8_t *ciphertext, size_t length) const;
-  void record_ciphertext_(CryptoContext &context, const uint8_t *ciphertext,
-                          size_t length);
+  bool is_replayed_action_(const CryptoContext &context, const DecodedCommand &command) const;
+  void record_action_(CryptoContext &context, const DecodedCommand &command);
   bool seq_matches_(const CryptoContext &context, const FrameHeader &header) const;
-  bool seq_in_use_(uint8_t seq_a, uint8_t seq_b) const;
-  std::string describe_generations_() const;
-  bool any_generation_valid_() const;
-  bool has_newer_used_generation_(const CryptoContext &context) const;
-  CryptoContext *find_generation_(const FrameHeader &header);
-  CryptoContext &allocate_generation_();
 
-  std::array<CryptoContext, GENERATIONS> generations_{};
-  uint32_t serial_counter_{0};
-
-  // A keypad that comes back from a long idle can open with an IV this bridge
-  // no longer holds. It has no way to ask for a new one except by timing out
-  // first, so answer the very first unmatched frame of a connection with a
-  // fresh IV instead of silence. Once per connection: reset_transport() runs on
-  // every BLE connect and disconnect, which is exactly the retry budget we want
-  // and keeps a noisy peer from churning the generation ring.
-  bool recovery_iv_sent_{false};
+  CryptoContext active_{};
+  CryptoContext pending_{};
+  // Immediate predecessor retained only when pending_ was committed by a
+  // state poll. The next valid encrypted frame, a fresh IV request, transport
+  // boundary, slot change or reset discards it. pending_ and retired_ never
+  // coexist.
+  CryptoContext retired_{};
 
   std::array<uint8_t, 20> iv_response_{0x01, 0x00, 0x00, 0x00};
 
@@ -157,6 +145,9 @@ class LockSession {
   // newer pending_ IV has already been advertised.
   std::array<uint8_t, AES_IV_SIZE> response_iv_{};
   bool response_iv_valid_{false};
+
+  bool unknown_iv_{false};        // last frame used an IV we do not hold
+  bool recovery_iv_sent_{false};  // fresh IV already offered on this connection
 
   FrameHeader header_{};
   DecodedCommand command_{};

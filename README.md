@@ -28,14 +28,15 @@ whether that lock is virtual, physical, or both.
 - 🔓 **No SwitchBot Lock required** — repurpose a keypad as a standalone, fully
   local door/access controller.
 - 🔒 **Optional physical lock relay** — link a real SwitchBot Lock in the same
-  wizard and the bridge forwards keypad protocol messages over encrypted BLE.
+  wizard and the bridge forwards supported lock/unlock commands using the
+  shared protocol key.
 - 📟 **Every SwitchBot keypad works** — Keypad, Keypad Touch, Keypad Vision and
   Vision Pro: that's the whole lineup. Touch and Vision are tested on real
   hardware; the other two speak the exact same protocols.
 - 📲 **On-device setup wizard** — the ESP32 serves a small web page: sign in to
   your SwitchBot account, pick the keypad, optionally link the lock, done.
 - 👤 **Knows who unlocked** — every unlock carries the method (`pin` /
-  `fingerprint` / `nfc` / `face`) and the credential slot, so you can act per user.
+  `fingerprint` / `nfc` / `face` / `palm`) and the credential slot, so you can act per user.
 - 🔔 **Doorbell, no lock needed** — on Keypad Vision the doorbell button is
   enabled automatically during setup (the app normally hides it until a lock
   is bound) and each press fires its own Home Assistant event.
@@ -151,7 +152,7 @@ Every `on_unlock` trigger carries two values:
 
 | Parameter | Type | Values |
 |---|---|---|
-| `method` | `std::string` | `"pin"`, `"fingerprint"`, `"nfc"`, `"face"`, or `"unknown"` |
+| `method` | `std::string` | `"pin"`, `"fingerprint"`, `"nfc"`, `"face"`, `"palm"`, or `"unknown"` |
 | `index` | `int` | Numeric ID of the credential slot |
 
 `index` is the slot the SwitchBot app assigns when you add a credential — first
@@ -232,6 +233,93 @@ switchbot_keypad_bridge:
 
 > Vision family only — Original / Touch keypads have no doorbell button.
 
+## Face and palm unlock rearming (Keypad Vision)
+
+After an unlock, Keypad Vision's passive face and palm recognition needs to see
+`LOCKED` again before it can scan again. The bridge rearms it automatically
+after **20 seconds by default**, so subsequent face/palm unlocks can work
+without pressing the keypad's Lock button. Configure this delay with
+`rearm_after`, or set `rearm_after: 0s` and call
+`switchbot_keypad_bridge.rearm` when your actual lock or garage door closes.
+
+This action reports `LOCKED` on the keypad's **next state poll**. It does not
+operate a physical lock, emit a `Lock` event, or trigger `on_lock`, even with
+physical lock relay enabled. It is not a command to start a scan immediately.
+
+### Automatic rearm delay
+
+`rearm_after` controls when passive face/palm unlock can rearm on Keypad
+Vision. The timer runs locally on the ESP32, with no dependency on HA:
+
+```yaml
+switchbot_keypad_bridge:
+  id: keypad_bridge
+  rearm_after: 20s
+```
+
+The default is `20s`, even when the option is omitted. Choose a different
+duration to customize the delay, or `0s` to disable automatic rearming.
+Every accepted unlock, regardless of method (face, palm, PIN, fingerprint,
+or NFC), restarts the countdown; its purpose is to make passive face/palm
+scanning available again. Explicit rearm or a keypad Lock command cancels it.
+The timer survives BLE disconnects, but pairing reset or linking a new keypad
+cancels it. Reboots start with the emulated lock in its usual locked state;
+pending timers are not persisted. At expiry the bridge changes the state
+reported on the next keypad poll, so scanning is not guaranteed to resume
+at exactly the configured delay.
+
+The timer does not know whether the door is open or the physical lock has
+finished moving. Set `rearm_after: 0s` when rearming must follow confirmed
+closure. Using a closure automation with the default timer does not prevent
+the timer from rearming while the door is still open.
+
+### Optional button
+
+Uncomment this example to expose a button in Home Assistant. Pressing it
+calls the same `switchbot_keypad_bridge.rearm` action:
+
+```yaml
+# Optional button to manually rearm face/palm unlock.
+# button:
+#   - platform: template
+#     name: "Rearm keypad"
+#     icon: mdi:lock-check
+#     on_press:
+#       - switchbot_keypad_bridge.rearm: keypad_bridge
+```
+
+Local ESPHome automations (including sensor or MQTT callbacks) can also call
+`switchbot_keypad_bridge.rearm` directly.
+
+To rearm only when your actual lock reports that it is locked, set
+`rearm_after: 0s`, enable the button above, and use a Home Assistant automation:
+
+```yaml
+alias: Re-arm SwitchBot keypad when the door locks
+triggers:
+  - trigger: state
+    entity_id: lock.front_door
+    to: "locked"
+actions:
+  - action: button.press
+    target:
+      entity_id: button.switchbot_keypad_bridge_rearm_keypad
+mode: single
+```
+
+Replace the example entity IDs with yours. For a garage door, use its confirmed
+`closed` state instead. Choose the signal that means your installation is ready
+for another unlock; a door contact being closed does not necessarily mean a
+deadbolt is locked.
+
+Building on the investigation in
+[#14](https://github.com/pierluigizagaria/switchbot-keypad-bridge/issues/14),
+the first pull request for locked-state synchronization was
+[#29 by Antti](https://github.com/pierluigizagaria/switchbot-keypad-bridge/pull/29),
+including documentation and an external-lock automation example, followed by
+[#30 by dr-apple](https://github.com/pierluigizagaria/switchbot-keypad-bridge/pull/30).
+Both contributions informed this shared action and configurable timer.
+
 ## 🔋 Battery sensors
 
 The keypad and linked physical lock broadcast their battery levels in BLE
@@ -259,10 +347,15 @@ switchbot_keypad_bridge:
 | `keypad_battery_level` | sensor | no | Battery percentage of the linked keypad, read from its BLE advertisement (Diagnostic category). |
 | `lock_battery_level` | sensor | no | Battery percentage of the linked physical lock, read from its BLE advertisement (Diagnostic category). |
 | `battery_scan_interval` | time | no | How often the bridge refreshes keypad and lock battery sensors with the shared advertisement scan. Default `15min`. |
+| `rearm_after` | time | no | Delay before rearming Keypad Vision's passive face/palm unlock after the latest accepted unlock. Default `20s`; `0s` disables the timer. Does not track actual door/lock state. |
 | `reset_button` | button | no | Button that forgets the linked keypad and lock, rotates the session key and re-opens the setup wizard (no reboot). |
 | `on_lock` | automation | no | Triggered on every `lock` command. |
 | `on_unlock` | automation | no | Triggered on every `unlock` command — parameters `(std::string method, int index)`. |
 | `on_doorbell` | automation | no | Triggered on every doorbell press (Keypad Vision). No parameters. |
+
+Automation action: `switchbot_keypad_bridge.rearm: <bridge_id>` (or
+`switchbot_keypad_bridge.rearm: {id: <bridge_id>}`) reports the emulated lock
+as locked and cancels pending automatic rearm. No button entity is required.
 
 ## 🔬 Under the hood
 
@@ -287,6 +380,39 @@ switchbot_keypad_bridge:
 - **Key hygiene** — reset rotates the shared keypad/lock session key and clears
   the linked lock record, so a previously linked keypad can no longer command
   the bridge.
+
+## Security limits
+
+The keypad protocol uses AES-CTR without a message authentication tag. CTR
+encryption does not prove who sent a command or detect deliberate changes to
+its ciphertext. The bridge does not currently require authenticated BLE
+pairing. An attacker able to capture and submit frames under a still-valid IV
+can forge a previously unseen command; action deduplication cannot prevent
+that. Requiring authenticated BLE would need compatibility testing with the
+keypad, and adding a tag only on the bridge would not change the keypad's
+protocol. Treat these limits as part of the threat model when using the bridge
+to control physical access.
+
+The bridge accepts only supported commands and unlock methods (PIN, NFC,
+fingerprint, face and palm). Unsupported frames are dropped and never relayed
+to a physical lock. For each IV, it remembers LOCK and every accepted
+method/credential-byte pair until that IV is discarded, including across
+ordinary BLE reconnects. The history has fixed memory use and never evicts an
+earlier action. Changing ignored trailing bytes or the payload length cannot
+make a repeated decoded action execute again.
+
+Consequently, a second legitimate identical action in the same IV is also
+dropped: the protocol provides no authenticated per-command counter to tell
+it apart from a replay. Adopting a new IV permits the action again. State polls
+and doorbell presses may repeat. Vision's one-action predecessor hand-off
+remains bounded by protocol events and is revoked at a transport boundary.
+
+Host-side regression tests cover the action history, altered payloads,
+unsupported commands and IV hand-off boundaries:
+
+```sh
+sh tests/run_lock_session_tests.sh
+```
 
 ## ❓ FAQ
 

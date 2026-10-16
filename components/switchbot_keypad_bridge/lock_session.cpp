@@ -1,6 +1,5 @@
 #include "lock_session.h"
 
-#include <cstdio>
 #include <cstring>
 
 #include <esp_random.h>
@@ -18,6 +17,7 @@ const char *const TAG = "switchbot_keypad_bridge.session";
 
 // Encrypted protocol framing.
 constexpr uint8_t PROTOCOL_MAGIC = 0x57;
+constexpr uint8_t VISION_KEY_SLOT = 0xC6;
 
 // Session IV negotiation. Most keypads send this after connect; some reconnect
 // and continue with the IV they already have.
@@ -29,29 +29,46 @@ constexpr size_t IV_RESPONSE_HEADER = 4;  // iv_response_ prefix before the IV b
 }  // namespace
 
 void LockSession::reset() {
-  for (auto &generation : this->generations_) {
-    generation = CryptoContext{};
-  }
-  this->serial_counter_ = 0;
+  this->active_ = CryptoContext{};
+  this->pending_ = CryptoContext{};
+  this->retired_ = CryptoContext{};
   this->reset_transport();
 }
 
 void LockSession::reset_transport() {
-  this->clear_decoded_();
+  this->clear_transient_();
+  this->retired_ = CryptoContext{};
+  this->active_.late_action_allowed = false;
+  this->active_.handoff_poll_seen = false;
   this->recovery_iv_sent_ = false;
 }
 
-void LockSession::clear_decoded_() {
+void LockSession::clear_transient_() {
   this->plaintext_size_ = 0;
   this->header_ = FrameHeader{};
   this->command_ = DecodedCommand{};
   this->response_iv_valid_ = false;
+  this->unknown_iv_ = false;
+}
+
+bool LockSession::offer_recovery_iv() {
+  // The keypad keeps encrypting under an IV we do not hold (e.g. it missed
+  // our IV response). Advertise a fresh IV once per BLE connection so it can
+  // resynchronise instead of retrying forever. Never during a Fast Unlock
+  // hand-off: replacing retired_ would strand a legitimate late action.
+  if (!this->unknown_iv_ || this->recovery_iv_sent_ || this->retired_.valid ||
+      this->slot_id_ == 0x00) {
+    return false;
+  }
+  this->recovery_iv_sent_ = true;
+  this->ensure_pending_iv_();
+  return true;
 }
 
 LockSession::Action LockSession::process_frame(const std::string &frame) {
   // Never expose stale decoded bytes or a stale response IV after a dropped
   // frame. The bridge may relay plaintext asynchronously after COMMAND.
-  this->clear_decoded_();
+  this->clear_transient_();
 
   ESP_LOGV(TAG, "RX WIRE %zu bytes: %s", frame.size(),
            format_hex_pretty(reinterpret_cast<const uint8_t *>(frame.data()), frame.size()).c_str());
@@ -63,13 +80,18 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
     const uint8_t requested_slot = static_cast<uint8_t>(frame[7]);
     if (requested_slot != this->slot_id_) {
       ESP_LOGI(TAG, "Token slot: 0x%02X", requested_slot);
+      // Crypto contexts are not bound to the key_id byte carried outside the
+      // ciphertext. Treat a slot change as a hard session boundary so neither
+      // an active, pending nor retired IV can be relabelled for the new slot.
+      this->active_ = CryptoContext{};
+      this->pending_ = CryptoContext{};
+      this->retired_ = CryptoContext{};
       this->slot_id_ = requested_slot;
     }
     ESP_LOGD(TAG, "IV request");
-    // Add a generation instead of replacing one. Vision-family keypads can
-    // renegotiate several times in a row and still finish frames from an
-    // earlier generation afterwards.
-    this->negotiate_new_iv_();
+    // Do not overwrite active_ yet. Vision-family keypads can send a delayed
+    // state poll from the previous generation after requesting the next IV.
+    this->ensure_pending_iv_();
     return Action::SEND_IV;
   }
 
@@ -90,47 +112,51 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   // Refuse encrypted frames before any IV has been negotiated for this key.
   // BLE reconnects may preserve active_, but a fresh boot/reset must not
   // decrypt against a zero or unrelated IV.
-  if (!this->any_generation_valid_()) {
+  if (!this->active_.valid && !this->pending_.valid) {
     ESP_LOGW(TAG, "Dropping encrypted frame: no IV negotiated");
     return Action::NONE;
   }
 
-  // The protocol echoes IV[0..1] as seq_a/seq_b, so the seq pair selects the
-  // generation. negotiate_new_iv_() guarantees the pair is unique across all
-  // live generations.
-  CryptoContext *generation = this->find_generation_(this->header_);
-  if (generation == nullptr) {
-    ESP_LOGW(TAG, "Unknown IV: len=%zu key=0x%02X seq=%02X%02X | live: %s", frame.size(),
-             this->header_.key_id, this->header_.seq_a, this->header_.seq_b,
-             this->describe_generations_().c_str());
-    if (!this->recovery_iv_sent_) {
-      this->recovery_iv_sent_ = true;
-      this->negotiate_new_iv_();
-      ESP_LOGW(TAG, "Offering a fresh IV to resynchronise the keypad");
-      return Action::SEND_IV;
-    }
-    ESP_LOGW(TAG, "Dropping frame: seq_a/seq_b mismatch (already offered a fresh IV)");
+  // The protocol echoes IV[0..1] as seq_a/seq_b. Prefer pending_ when the
+  // keypad has switched, then active_, then the one short-lived predecessor
+  // retained for the Fast Unlock race. Valid contexts always have distinct
+  // seq pairs and pending_/retired_ never coexist.
+  const bool uses_pending = this->seq_matches_(this->pending_, this->header_);
+  const bool uses_active = this->seq_matches_(this->active_, this->header_);
+  const bool uses_retired = this->seq_matches_(this->retired_, this->header_);
+  if (!uses_pending && !uses_active && !uses_retired) {
+    ESP_LOGW(TAG, "Dropping frame: seq_a/seq_b mismatch (cross-session replay?)");
+    this->unknown_iv_ = true;
     return Action::NONE;
   }
-  CryptoContext &context = *generation;
+
+  // After pending_ was promoted by a poll, retired_ is eligible for exactly
+  // the next valid encrypted frame. Seeing the current generation first is a
+  // deterministic proof that the predecessor hand-off has ended.
+  if (uses_active && this->retired_.valid) {
+    ESP_LOGV(TAG, "Current IV observed; closing predecessor hand-off");
+    this->retired_ = CryptoContext{};
+  }
+  CryptoContext &context = uses_pending ? this->pending_
+                           : uses_active ? this->active_
+                                         : this->retired_;
 
   const size_t ct_len = frame.size() - HEADER_LEN;
   if (ct_len > MAX_PAYLOAD) {
     ESP_LOGW(TAG, "Dropping frame with invalid payload length: %zu", ct_len);
+    if (uses_retired) {
+      this->retired_ = CryptoContext{};
+    }
     return Action::NONE;
   }
 
   const uint8_t *ciphertext = reinterpret_cast<const uint8_t *>(frame.data() + HEADER_LEN);
 
-  // Intra-session replay protection for state-changing actions: under a
-  // fixed session IV, identical plaintexts produce identical ciphertexts.
-  // We only flag duplicates that decode to a side-effecting command — state
-  // polls are idempotent and a legitimate keypad emits them repeatedly.
-  const bool ciphertext_seen =
-      this->is_replayed_ciphertext_(context, ciphertext, ct_len);
-
   uint8_t plaintext[MAX_PAYLOAD];
   if (!this->xcrypt_(context.iv, ciphertext, ct_len, plaintext)) {
+    if (uses_retired) {
+      this->retired_ = CryptoContext{};
+    }
     return Action::NONE;  // error already logged
   }
 
@@ -138,36 +164,89 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
 
   this->command_ = decode_lock_command(plaintext, ct_len);
 
-  // A generation is superseded only once the keypad has *proved* it moved on
-  // by sending a frame under a newer IV. From that point the old generation is
-  // accepted for idempotent state polls only, so a delayed or captured lock or
-  // unlock can never cross the hand-off boundary even if its ciphertext was
-  // not present in the small replay ring. Merely advertising the next IV does
-  // not supersede anything: the keypad routinely keeps using the current
-  // generation after asking for a new one, and dropping those frames left it
-  // without an answer.
-  const bool superseded = this->has_newer_used_generation_(context);
-  if (superseded && this->command_.type != CommandType::STATE_POLL) {
-    ESP_LOGW(TAG, "Dropping non-poll frame under superseded IV");
-    this->command_ = DecodedCommand{};
-    return Action::NONE;
+  // Fast Unlock on Vision periodically rotates the IV while an action can
+  // already be in flight under the predecessor: a credential UNLOCK, or a
+  // LOCK from the keypad's lock button (observed: Lock sent 0.7 s after an
+  // IV request, before the keypad switched). Admit one such action before or
+  // immediately after a state poll promotes pending_. LOCK only moves the
+  // door to the safe state, so it is no riskier than the late UNLOCK. This
+  // allowance is bounded only by protocol events: no wall-clock timeout is
+  // involved.
+  const bool uses_predecessor =
+      uses_retired || (uses_active && this->pending_.valid);
+  const bool has_known_unlock_method = unlock_method_index(this->command_.method) >= 0;
+  const bool is_late_action =
+      (this->command_.type == CommandType::UNLOCK && has_known_unlock_method) ||
+      this->command_.type == CommandType::LOCK;
+
+  // While pending_ is uncommitted, tolerate one already-in-flight poll under
+  // active_. A second such poll proves the overlap has advanced without an
+  // unlock and deterministically closes the allowance.
+  if (uses_active && this->pending_.valid &&
+      this->command_.type == CommandType::STATE_POLL &&
+      context.late_action_allowed) {
+    if (context.handoff_poll_seen) {
+      context.late_action_allowed = false;
+      ESP_LOGV(TAG, "Second predecessor poll closed hand-off allowance");
+    } else {
+      context.handoff_poll_seen = true;
+    }
+  }
+
+  if (uses_predecessor && this->command_.type != CommandType::STATE_POLL) {
+    // The first non-poll predecessor attempt always consumes the capability,
+    // even when its command or replay status makes the frame inadmissible.
+    const bool accept_late_action = is_late_action && context.late_action_allowed;
+    context.late_action_allowed = false;
+    if (!accept_late_action) {
+      ESP_LOGW(TAG, "Dropping non-poll frame under superseded IV");
+      this->command_ = DecodedCommand{};
+      if (uses_retired) {
+        this->retired_ = CryptoContext{};
+      }
+      return Action::NONE;
+    }
   }
 
   if (this->command_.type == CommandType::UNKNOWN) {
-    ESP_LOGI(TAG, "Unhandled command: %s", format_hex_pretty(plaintext, ct_len).c_str());
+    ESP_LOGW(TAG, "Dropping unsupported keypad command");
+    if (uses_pending) {
+      // Even an unsupported attempt under the new IV closes the older action
+      // window. Do not execute or promote it, and do not leave a predecessor
+      // capability open after seeing traffic from the next generation.
+      this->active_.late_action_allowed = false;
+      this->active_.handoff_poll_seen = false;
+    }
+    if (uses_retired) {
+      this->retired_ = CryptoContext{};
+    }
+    return Action::NONE;
   }
 
   // DOORBELL is deliberately left out of the replay filter: under a fixed
   // session IV a second legitimate press in the same connection produces the
   // exact same ciphertext, and dropping it would swallow real rings. Worst
-  // case for a replayed doorbell frame is a spurious chime; a replayed
-  // lock/unlock changes security state, so only those are filtered.
+  // case for a replayed doorbell frame is a spurious chime; a repeated
+  // lock/unlock changes security state, so those actions are deduplicated.
   if (this->command_.type == CommandType::LOCK || this->command_.type == CommandType::UNLOCK) {
-    if (ciphertext_seen) {
-      ESP_LOGW(TAG, "Dropping action: ciphertext replay within session");
+    // Deduplicate the decoded action for the whole lifetime of its IV. A
+    // different padding byte or payload length must not bypass the history.
+    // The original credential byte avoids conflating two IDs through the
+    // display-index heuristic. This is not authentication:
+    // CTR still permits an attacker to forge a previously unseen action.
+    if (this->is_replayed_action_(context, this->command_)) {
+      ESP_LOGW(TAG, "Dropping repeated action within session");
+      this->command_ = DecodedCommand{};
+      if (uses_retired) {
+        this->retired_ = CryptoContext{};
+      }
       return Action::NONE;
     }
-    this->record_ciphertext_(context, ciphertext, ct_len);
+    this->record_action_(context, this->command_);
+    if (uses_predecessor) {
+      context.late_action_allowed = false;
+      ESP_LOGI(TAG, "Accepted one late action under predecessor IV");
+    }
   }
 
   std::memcpy(this->plaintext_.data(), plaintext, ct_len);
@@ -175,12 +254,24 @@ LockSession::Action LockSession::process_frame(const std::string &frame) {
   this->response_iv_ = context.iv;
   this->response_iv_valid_ = true;
 
-  if (!context.used) {
-    context.used = true;
-    ESP_LOGI(TAG, "Keypad switched to IV generation %u",
-             static_cast<unsigned>(context.serial));
-  } else if (superseded) {
-    ESP_LOGD(TAG, "Accepted delayed state poll under superseded IV");
+  if (uses_pending) {
+    // Only a poll can race an older credential action. Any other supported
+    // command under pending_ commits the new generation outright.
+    const bool retain_predecessor =
+        this->command_.type == CommandType::STATE_POLL && this->active_.valid &&
+        this->active_.late_action_allowed;
+    this->retired_ = retain_predecessor ? this->active_ : CryptoContext{};
+    this->active_ = this->pending_;
+    this->active_.late_action_allowed = false;
+    this->active_.handoff_poll_seen = false;
+    this->pending_ = CryptoContext{};
+    ESP_LOGV(TAG, "Pending IV promoted");
+  } else if (uses_retired) {
+    // response_iv_ already snapshots the matching IV, so the one-frame
+    // predecessor can be destroyed before the bridge sends its ACK.
+    this->retired_ = CryptoContext{};
+  } else if (this->pending_.valid) {
+    ESP_LOGD(TAG, "Accepted delayed frame under active predecessor IV");
   }
 
   return Action::COMMAND;
@@ -190,6 +281,9 @@ bool LockSession::is_iv_request_(const std::string &frame) const {
   return frame.size() >= SESSION_IV_REQ_MIN &&
          static_cast<uint8_t>(frame[0]) == PROTOCOL_MAGIC &&
          static_cast<uint8_t>(frame[1]) == 0x00 &&
+         static_cast<uint8_t>(frame[2]) == 0x00 &&
+         static_cast<uint8_t>(frame[3]) == 0x00 &&
+         static_cast<uint8_t>(frame[4]) == 0x0F &&
          static_cast<uint8_t>(frame[5]) == 0x21 &&
          static_cast<uint8_t>(frame[6]) == 0x03;
 }
@@ -221,149 +315,84 @@ bool LockSession::xcrypt_(const std::array<uint8_t, AES_IV_SIZE> &iv,
   return aes_ctr_xcrypt(this->aes_key_, iv.data(), input, output, length);
 }
 
-void LockSession::negotiate_new_iv_() {
-  CryptoContext &slot = this->allocate_generation_();
-  slot = CryptoContext{};  // invalid while we search, so it never matches itself
-  auto fill_iv = [&slot]() {
+void LockSession::ensure_pending_iv_() {
+  // The request carries no transaction identifier. Until a frame proves that
+  // the keypad adopted pending_, same-slot requests are retries of the same
+  // negotiation and must receive the same IV. Replacing it here strands a
+  // command already encrypted with the previously advertised IV (#19).
+  if (this->pending_.valid) {
+    std::memcpy(this->iv_response_.data() + IV_RESPONSE_HEADER,
+                this->pending_.iv.data(), AES_IV_SIZE);
+    ESP_LOGV(TAG, "Reusing pending IV: %s",
+             format_hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
+    return;
+  }
+
+  // A fresh request starts the next hand-off. The previously retired context
+  // is now more than one generation old and must not overlap the new pending
+  // IV. Arm a one-shot late-action allowance on the current active context;
+  // retries above deliberately neither replace pending_ nor alter this state.
+  this->retired_ = CryptoContext{};
+  if (this->active_.valid && this->slot_id_ == VISION_KEY_SLOT) {
+    this->active_.late_action_allowed = true;
+    this->active_.handoff_poll_seen = false;
+  } else if (this->active_.valid) {
+    this->active_.late_action_allowed = false;
+    this->active_.handoff_poll_seen = false;
+  }
+
+  this->pending_ = CryptoContext{};
+  auto fill_iv = [this]() {
     for (size_t i = 0; i < AES_IV_SIZE; i += 4) {
       const uint32_t value = esp_random();
-      std::memcpy(slot.iv.data() + i, &value, 4);
+      std::memcpy(this->pending_.iv.data() + i, &value, 4);
     }
   };
   fill_iv();
 
-  // seq_a/seq_b are the only generation selector carried on the wire, so the
-  // pair must be unique across every live generation. Bound the RNG retries so
-  // a broken RNG cannot stall the BLE task, then fall back to a deterministic
-  // scan of seq_b, which always finds a free pair: at most GENERATIONS - 1
-  // other generations are live and 256 candidates exist.
+  // seq_a/seq_b are the only generation selector carried on the wire. Avoid
+  // an ambiguous active/pending pair. Bound the retries so a broken RNG
+  // cannot stall the BLE task; the final bit flip still makes the pair unique.
   size_t retries = 0;
-  while (this->seq_in_use_(slot.iv[0], slot.iv[1]) && retries++ < 4) {
+  while (this->active_.valid && this->pending_.iv[0] == this->active_.iv[0] &&
+         this->pending_.iv[1] == this->active_.iv[1] && retries++ < 4) {
     fill_iv();
   }
-  if (this->seq_in_use_(slot.iv[0], slot.iv[1])) {
-    for (uint16_t delta = 1; delta <= 0xFF; ++delta) {
-      const uint8_t candidate = static_cast<uint8_t>(slot.iv[1] ^ delta);
-      if (!this->seq_in_use_(slot.iv[0], candidate)) {
-        slot.iv[1] = candidate;
-        break;
-      }
-    }
+  if (this->active_.valid && this->pending_.iv[0] == this->active_.iv[0] &&
+      this->pending_.iv[1] == this->active_.iv[1]) {
+    this->pending_.iv[1] ^= 0x01;
   }
-
-  slot.serial = ++this->serial_counter_;
-  slot.valid = true;
+  this->pending_.valid = true;
   std::memcpy(this->iv_response_.data() + IV_RESPONSE_HEADER,
-              slot.iv.data(), AES_IV_SIZE);
-  ESP_LOGI(TAG, "New IV: generation %u seq=%02X%02X", static_cast<unsigned>(slot.serial),
-           slot.iv[0], slot.iv[1]);
-  ESP_LOGV(TAG, "New IV (generation %u): %s", static_cast<unsigned>(slot.serial),
-           format_hex_pretty(slot.iv.data(), AES_IV_SIZE).c_str());
+              this->pending_.iv.data(), AES_IV_SIZE);
+  ESP_LOGV(TAG, "Pending IV: %s",
+           format_hex_pretty(this->pending_.iv.data(), AES_IV_SIZE).c_str());
 }
 
-// Compact one-line inventory for the unknown-IV warning: which generations the
-// bridge still holds, in negotiation order, and whether the keypad adopted them.
-std::string LockSession::describe_generations_() const {
-  std::string out;
-  for (const auto &generation : this->generations_) {
-    if (!generation.valid) {
-      continue;
-    }
-    char buf[32];
-    std::snprintf(buf, sizeof(buf), "%s#%u:%02X%02X%s", out.empty() ? "" : " ",
-                  static_cast<unsigned>(generation.serial), generation.iv[0], generation.iv[1],
-                  generation.used ? "*" : "");
-    out += buf;
+bool LockSession::is_replayed_action_(const CryptoContext &context,
+                                      const DecodedCommand &command) const {
+  if (command.type == CommandType::LOCK) {
+    return context.lock_seen;
   }
-  return out.empty() ? "none" : out;
-}
-
-bool LockSession::seq_in_use_(uint8_t seq_a, uint8_t seq_b) const {
-  for (const auto &generation : this->generations_) {
-    if (generation.valid && generation.iv[0] == seq_a && generation.iv[1] == seq_b) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool LockSession::any_generation_valid_() const {
-  for (const auto &generation : this->generations_) {
-    if (generation.valid) {
-      return true;
-    }
-  }
-  return false;
-}
-
-bool LockSession::has_newer_used_generation_(const CryptoContext &context) const {
-  for (const auto &generation : this->generations_) {
-    if (generation.valid && generation.used && generation.serial > context.serial) {
-      return true;
-    }
-  }
-  return false;
-}
-
-LockSession::CryptoContext *LockSession::find_generation_(const FrameHeader &header) {
-  CryptoContext *match = nullptr;
-  for (auto &generation : this->generations_) {
-    if (this->seq_matches_(generation, header) &&
-        (match == nullptr || generation.serial > match->serial)) {
-      match = &generation;
-    }
-  }
-  return match;
-}
-
-// Free slot first; then the oldest generation the keypad never adopted, since
-// an advertised-but-unused IV carries no live traffic; only if every slot is
-// in use does the oldest adopted generation get recycled. Without the
-// unused-first rule a keypad that asks for a new IV on every reconnect but
-// keeps talking under the one it already has would evict its own live
-// generation after GENERATIONS handshakes.
-LockSession::CryptoContext &LockSession::allocate_generation_() {
-  CryptoContext *oldest = nullptr;
-  CryptoContext *oldest_unused = nullptr;
-  for (auto &generation : this->generations_) {
-    if (!generation.valid) {
-      return generation;
-    }
-    if (oldest == nullptr || generation.serial < oldest->serial) {
-      oldest = &generation;
-    }
-    if (!generation.used && (oldest_unused == nullptr || generation.serial < oldest_unused->serial)) {
-      oldest_unused = &generation;
-    }
-  }
-  CryptoContext *victim = oldest_unused != nullptr ? oldest_unused : oldest;
-  ESP_LOGI(TAG, "Recycling IV generation %u", static_cast<unsigned>(victim->serial));
-  return *victim;
-}
-
-bool LockSession::is_replayed_ciphertext_(const CryptoContext &context,
-                                          const uint8_t *ciphertext,
-                                          size_t length) const {
-  if (length == 0 || length > MAX_PAYLOAD) {
+  const int method = unlock_method_index(command.method);
+  if (command.type != CommandType::UNLOCK || method < 0) {
     return false;
   }
-  for (const auto &entry : context.replay_history) {
-    if (entry.length == length && std::memcmp(entry.data.data(), ciphertext, length) == 0) {
-      return true;
-    }
-  }
-  return false;
+  const size_t index = command.credential_wire_index;
+  return (context.unlock_history[method][index / 8] & (1u << (index % 8))) != 0;
 }
 
-void LockSession::record_ciphertext_(CryptoContext &context,
-                                     const uint8_t *ciphertext, size_t length) {
-  if (length == 0 || length > MAX_PAYLOAD) {
+void LockSession::record_action_(CryptoContext &context, const DecodedCommand &command) {
+  if (command.type == CommandType::LOCK) {
+    context.lock_seen = true;
     return;
   }
-  ReplayEntry &slot = context.replay_history[context.replay_head];
-  std::memcpy(slot.data.data(), ciphertext, length);
-  slot.length = length;
-  context.replay_head = (context.replay_head + 1) % REPLAY_HISTORY_SIZE;
+  const int method = unlock_method_index(command.method);
+  if (command.type != CommandType::UNLOCK || method < 0) {
+    return;
+  }
+  const size_t index = command.credential_wire_index;
+  context.unlock_history[method][index / 8] |= static_cast<uint8_t>(1u << (index % 8));
 }
 
 bool LockSession::seq_matches_(const CryptoContext &context,

@@ -35,6 +35,11 @@ time:
   - platform: sntp
 
 switchbot_keypad_bridge:
+  id: keypad_bridge
+  # Rearm Keypad Vision's passive face/palm unlock after each unlock.
+  # Default: 20s. Set 0s to rearm only on confirmed lock/door closure.
+  rearm_after: 20s
+
   keypad_action:
     name: "Action"
 
@@ -56,7 +61,7 @@ switchbot_keypad_bridge:
     name: "Reset"
 
   on_unlock:
-    # method: "pin" | "fingerprint" | "nfc" | "face" | "unknown"   index: credential slot
+    # method: "pin" | "fingerprint" | "nfc" | "face" | "palm" | "unknown"   index: credential slot
     - homeassistant.event:
         event: esphome.switchbot_keypad_unlock
         data:
@@ -68,3 +73,11 @@ switchbot_keypad_bridge:
 
   # on_doorbell:
   #   - logger.log: "Doorbell pressed"
+
+# Optional button to manually rearm face/palm unlock using the same action.
+# button:
+#   - platform: template
+#     name: "Rearm keypad"
+#     icon: mdi:lock-check
+#     on_press:
+#       - switchbot_keypad_bridge.rearm: keypad_bridge

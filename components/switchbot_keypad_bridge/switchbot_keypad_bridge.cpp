@@ -241,6 +241,7 @@ void SwitchbotKeypadBridge::loop() {
   this->apply_pending_pairing_();
   this->apply_pending_lock_link_();
   this->apply_pending_lock_relay_();
+  this->update_rearm_timer_();
 
   // Idle-close the wizard only once a keypad is linked: with nothing linked
   // the wizard is the device's whole purpose ("setup mode") and must stay
@@ -296,6 +297,7 @@ void SwitchbotKeypadBridge::apply_pending_pairing_() {
       info.valid = 1;
     }
     this->keypad_info_ = info;
+    this->keypad_state_.rearm();
     this->save_and_sync_(this->keypad_info_pref_, &this->keypad_info_);
 
     this->keypad_paired_ = true;
@@ -400,6 +402,7 @@ void SwitchbotKeypadBridge::reset_pairing() {
   // and forget the learned token slot along with it.
   this->session_.reset();
   this->session_.forget_slot();
+  this->keypad_state_.rearm();
 
   // Re-enter setup mode straight away with the rotated key.
   this->pairing_ui_.set_shared_key(this->shared_key_);
@@ -418,10 +421,23 @@ void ResetButton::press_action() {
   this->parent_->reset_pairing();
 }
 
+void SwitchbotKeypadBridge::rearm() {
+  this->keypad_state_.rearm();
+  ESP_LOGI(TAG, "Reporting locked state on the next keypad poll (rearm)");
+}
+
+void SwitchbotKeypadBridge::update_rearm_timer_() {
+  if (this->keypad_state_.update(millis())) {
+    ESP_LOGI(TAG, "Face/palm rearm timer expired; reporting locked state on the next keypad poll");
+  }
+}
+
 void SwitchbotKeypadBridge::dump_config() {
   ESP_LOGCONFIG(TAG, "SwitchBot Keypad Bridge:");
   ESP_LOGCONFIG(TAG, "  BLE address: %s", NimBLEDevice::getAddress().toString().c_str());
   ESP_LOGCONFIG(TAG, "  Setup UI: port 80");
+  ESP_LOGCONFIG(TAG, "  Face/palm rearm after: %ums (0 = disabled)",
+                static_cast<unsigned>(this->keypad_state_.rearm_after()));
   ESP_LOGCONFIG(TAG, "  Physical lock relay: %s",
                 this->lock_linked_ ? this->linked_lock_info_.name : "Unlinked");
   if (this->keypad_battery_level_sensor_ != nullptr ||
@@ -529,7 +545,13 @@ void SwitchbotKeypadBridge::on_rx_frame_(const std::string &frame) {
       return;
     case LockSession::Action::NONE:
     default:
-      return;  // dropped — the session logged why
+      // Dropped — the session logged why. If the keypad is stuck on an IV we
+      // do not hold, offer it a fresh one so it can resynchronise.
+      if (this->session_.offer_recovery_iv()) {
+        ESP_LOGW(TAG, "Offering a fresh IV to resynchronise the keypad");
+        this->notify_(this->session_.iv_response(), this->session_.iv_response_size());
+      }
+      return;
   }
 }
 
@@ -540,7 +562,7 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
   switch (command.type) {
     case CommandType::LOCK:
       ESP_LOGI(TAG, "Lock");
-      this->lock_state_ = LockState::LOCKED;
+      this->keypad_state_.rearm();
       this->publish_lock_();
       break;
 
@@ -548,7 +570,8 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
       ESP_LOGI(TAG, "Unlock: method=%s (0x%02X) index=%d",
                unlock_method_name(command.method),
                static_cast<uint8_t>(command.method), command.credential_index);
-      this->lock_state_ = LockState::UNLOCKED;
+      // Start before callbacks so an on_unlock automation can rearm explicitly.
+      this->keypad_state_.unlock(millis());
       this->publish_unlock_(command.method, command.credential_index);
       break;
 
@@ -574,7 +597,6 @@ void SwitchbotKeypadBridge::handle_command_(const FrameHeader &header, const Dec
     switch (command.type) {
       case CommandType::LOCK:
       case CommandType::UNLOCK:
-      case CommandType::UNKNOWN:
         if (!this->relay_to_lock_async_(header, command)) {
           ESP_LOGW(TAG, "Physical lock relay unavailable after local keypad response");
         }
@@ -615,8 +637,9 @@ void SwitchbotKeypadBridge::send_local_response_(const FrameHeader &header,
 }
 
 void SwitchbotKeypadBridge::handle_state_poll_(const FrameHeader &header) {
+  this->update_rearm_timer_();
   uint8_t state_payload[1 + sizeof(STATE_PAYLOAD_TAIL)];
-  state_payload[0] = static_cast<uint8_t>(this->lock_state_);
+  state_payload[0] = static_cast<uint8_t>(this->keypad_state_.lock_state());
   std::memcpy(state_payload + 1, STATE_PAYLOAD_TAIL, sizeof(STATE_PAYLOAD_TAIL));
   this->send_encrypted_response_(header, state_payload, sizeof(state_payload));
 }
@@ -640,6 +663,10 @@ PhysicalLockClient::Config SwitchbotKeypadBridge::physical_lock_config_(uint8_t 
 
 bool SwitchbotKeypadBridge::relay_to_lock_async_(const FrameHeader &header,
                                                  const DecodedCommand &command) {
+  if (command.type != CommandType::LOCK && command.type != CommandType::UNLOCK) {
+    ESP_LOGW(TAG, "Cannot relay unsupported keypad command");
+    return false;
+  }
   if (this->session_.plaintext_size() == 0) {
     ESP_LOGW(TAG, "Cannot relay command: no decrypted keypad plaintext");
     return false;

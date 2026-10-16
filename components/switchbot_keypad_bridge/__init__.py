@@ -39,7 +39,7 @@ from esphome.const import (
     STATE_CLASS_MEASUREMENT,
     UNIT_PERCENT,
 )
-from esphome.core import CORE, HexInt
+from esphome.core import CORE, HexInt, TimePeriod
 
 LOGGER = logging.getLogger(__name__)
 
@@ -54,6 +54,7 @@ CONF_LINKED_LOCK = "linked_lock"
 CONF_KEYPAD_BATTERY_LEVEL = "keypad_battery_level"
 CONF_LOCK_BATTERY_LEVEL = "lock_battery_level"
 CONF_BATTERY_SCAN_INTERVAL = "battery_scan_interval"
+CONF_REARM_AFTER = "rearm_after"
 CONF_RESET_BUTTON = "reset_button"
 CONF_ON_LOCK = "on_lock"
 CONF_ON_UNLOCK = "on_unlock"
@@ -73,6 +74,7 @@ SwitchbotKeypadBridge = switchbot_keypad_bridge_ns.class_(
     "SwitchbotKeypadBridge", cg.Component
 )
 ResetButton = switchbot_keypad_bridge_ns.class_("ResetButton", button.Button)
+RearmAction = switchbot_keypad_bridge_ns.class_("RearmAction", automation.Action)
 LockTrigger = switchbot_keypad_bridge_ns.class_(
     "LockTrigger", automation.Trigger.template()
 )
@@ -132,6 +134,12 @@ CONFIG_SCHEMA = cv.Schema(
         cv.Optional(
             CONF_BATTERY_SCAN_INTERVAL, default="15min"
         ): cv.positive_time_period_milliseconds,
+        cv.Optional(
+            CONF_REARM_AFTER, default="20s"
+        ): cv.All(
+            cv.positive_time_period_milliseconds,
+            cv.Range(max=TimePeriod(milliseconds=0x7FFFFFFF)),
+        ),
         cv.Optional(CONF_PAIRING_UI): _deprecated_pairing_ui,
         cv.Optional(CONF_RESET_BUTTON): button.button_schema(
             ResetButton,
@@ -197,9 +205,23 @@ def _final_validate(config):
 FINAL_VALIDATE_SCHEMA = _final_validate
 
 
+@automation.register_action(
+    "switchbot_keypad_bridge.rearm",
+    RearmAction,
+    cv.maybe_simple_value(
+        {cv.Required(CONF_ID): cv.use_id(SwitchbotKeypadBridge)}, key=CONF_ID
+    ),
+    synchronous=True,
+)
+async def rearm_to_code(config, action_id, template_arg, args):
+    parent = await cg.get_variable(config[CONF_ID])
+    return cg.new_Pvariable(action_id, template_arg, parent)
+
+
 async def to_code(config):
     var = cg.new_Pvariable(config[CONF_ID])
     await cg.register_component(var, config)
+    cg.add(var.set_rearm_after(config[CONF_REARM_AFTER].total_milliseconds))
 
     if keypad_conf := config.get(CONF_KEYPAD_ACTION):
         keypad = await event.new_event(
@@ -294,10 +316,14 @@ async def to_code(config):
     # The cloud client calls https://*.switchbot.net — pull in mbedTLS's
     # built-in certificate bundle so esp_crt_bundle_attach() finds the CAs
     # that sign those domains. Without CONFIG_MBEDTLS_CERTIFICATE_BUNDLE the
-    # TLS handshake fails with ESP_ERR_HTTP_CONNECT. Also tell ESP-IDF that
-    # this user component depends on esp_http_client and esp-tls so the
-    # headers and link symbols are visible to cloud_client.cpp.
+    # TLS handshake fails with ESP_ERR_HTTP_CONNECT. ESPHome excludes some
+    # built-in IDF components by default; re-enable the ones whose headers
+    # this component uses directly. This includes cJSON in both the cloud
+    # client and pairing UI, plus the pairing UI's HTTP server.
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", True)
     add_idf_sdkconfig_option("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", True)
     include_builtin_idf_component("esp_http_client")
     include_builtin_idf_component("esp-tls")
+    include_builtin_idf_component("json")
+    include_builtin_idf_component("esp_http_server")
+    include_builtin_idf_component("bt")

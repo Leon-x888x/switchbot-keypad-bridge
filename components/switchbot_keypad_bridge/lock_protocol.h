@@ -21,13 +21,22 @@ enum class UnlockMethod : uint8_t {
   NFC = 0x08,
   FINGERPRINT = 0x0C,
   FACE = 0x18,
+  // Palm/hand-vein recognition, confirmed by capturing the raw decrypted
+  // unlock frame on a Keypad Vision Pro (the method byte was previously
+  // unmapped and fell back to UNKNOWN/"unknown").
+  PALM = 0x20,
 };
 
 const char *unlock_method_name(UnlockMethod method);
 
+constexpr size_t UNLOCK_METHOD_COUNT = 5;
+// Dense index for a supported credential method, or -1 for an unknown byte.
+// Keep validation and the session's action history on the same allowlist.
+int unlock_method_index(UnlockMethod method);
+
 // The command a decrypted keypad frame represents. UNKNOWN means the bytes
-// matched no known frame; the bridge may still relay the raw plaintext to a
-// linked physical lock.
+// matched no supported frame or used an unknown credential method. Such
+// frames must not trigger automations or be relayed to a physical lock.
 enum class CommandType : uint8_t {
   UNKNOWN,
   LOCK,
@@ -40,6 +49,9 @@ struct DecodedCommand {
   CommandType type{CommandType::UNKNOWN};
   UnlockMethod method{UnlockMethod::UNKNOWN};
   int16_t credential_index{-1};
+  // Original byte from the protocol. Action history must not merge distinct
+  // credentials merely because the display-index heuristic maps them alike.
+  uint8_t credential_wire_index{0};
 };
 
 // Classify a decrypted plaintext frame. Returns a command with
